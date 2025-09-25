@@ -93,6 +93,12 @@ if [[ ${out_len} -ne ${expected_len} ]]; then
 fi
 pass "long line (100k)"
 
+# 10) monitor unit test build & run
+cc_cmd="${CC:-cc}"
+${cc_cmd} -std=c11 -O2 -Wall -Wextra -Werror -pthread tests/monitor_test.c -o build/monitor_test
+./build/monitor_test >/dev/null 2>&1 || fail "monitor_test failed"
+pass "monitor unit test"
+
 echo "All smoke tests passed."
 
 
