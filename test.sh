@@ -80,6 +80,19 @@ if ! echo "$err_out" | grep -E "(dlopen failed|missing required symbols)" >/dev/
 fi
 pass "missing plugin error message"
 
+# 9) long line (100k chars): ensure non-empty output and safe newline trim
+# Generate using Python for portability
+long_len=100000
+out_len=$(python3 -c "print('a'*${long_len})" | ./build/pipeline expander,uppercaser,sink_stdout | wc -c)
+if [[ ${out_len} -le 0 ]]; then
+  fail "long line: expected non-empty output, got length ${out_len}"
+fi
+expected_len=$((long_len + 1))
+if [[ ${out_len} -ne ${expected_len} ]]; then
+  fail "long line: expected byte length ${expected_len} (content + newline), got ${out_len}"
+fi
+pass "long line (100k)"
+
 echo "All smoke tests passed."
 
 
