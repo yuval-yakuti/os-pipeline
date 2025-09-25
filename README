@@ -1,33 +1,33 @@
 Modular Multithreaded String Pipeline (C11)
 
-Build
+## Build & Test
 
-- macOS (clang): plugins as .dylib, rpath @loader_path/plugins
-- Linux (gcc): plugins as .so, rpath $ORIGIN/plugins, link -ldl
+- Build:
+  - `./build.sh`
+- Run smoke tests:
+  - `./test.sh`
 
-Usage
+## Usage
 
-1. ./build.sh
-2. ./build/pipeline name1,name2,... < input.txt
+- Pipeline: `./build/pipeline name1,name2,... < input.txt`
+- Example: `echo "Hello World" | ./build/pipeline uppercaser,sink_stdout`
 
-Bounded Queue
+## Plugins
 
-- Mutex + two condition variables, closeable
-- Sentinel: literal string "<END>" propagated exactly once
+- `logger`: append to `output/pipeline.log`
+- `typewriter`: optional per-char delay (see env below)
+- `uppercaser`: convert to upper case
+- `rotator`: Caesar rotation by N
+- `flipper`: reverse string
+- `expander`: collapse spaces/tabs, trim edges
+- `sink_stdout`: print to stdout, consume end-of-stream
 
-Plugins
+## Env Vars
 
-- logger: append to output/pipeline.log
-- typewriter: optional per-char delay via env TYPEWRITER_DELAY_US (microseconds)
-- uppercaser: to upper
-- rotator: Caesar rotation via env ROTATE_N (default 13)
-- flipper: reverse string
-- expander: collapse spaces/tabs, trim ends
+- `ROTATE_N`: rotation amount for `rotator` (default: 13)
+- `TYPEWRITER_DELAY_US`: per-char delay in microseconds for `typewriter` (default: 100000). Tests set this to 1000.
 
-Environment
+## Build Notes
 
-- TYPEWRITER_DELAY_US=1000 ROTATE_N=5 ./build/pipeline logger,uppercaser
-
-Example with sink_stdout
-
-echo "Hello World" | ./build/pipeline uppercaser,sink_stdout
+- macOS (clang): plugins as `.dylib`, rpath `@loader_path/plugins`
+- Linux (gcc): plugins as `.so`, rpath `$ORIGIN/plugins`, link with `-ldl`

@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    name: ${{ matrix.os }} build & test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install GCC 13 (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-13
+
+      - name: Make scripts executable
+        run: |
+          chmod +x build.sh test.sh
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        env:
+          TYPEWRITER_DELAY_US: "1000"
+        run: |
+          CC=gcc-13 ./build.sh
+
+      - name: Test (Linux)
+        if: runner.os == 'Linux'
+        env:
+          TYPEWRITER_DELAY_US: "1000"
+        run: |
+          ./test.sh
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        env:
+          TYPEWRITER_DELAY_US: "1000"
+        run: |
+          ./build.sh
+
+      - name: Test (macOS)
+        if: runner.os == 'macOS'
+        env:
+          TYPEWRITER_DELAY_US: "1000"
+        run: |
+          ./test.sh
