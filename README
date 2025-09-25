@@ -1,0 +1,33 @@
+Modular Multithreaded String Pipeline (C11)
+
+Build
+
+- macOS (clang): plugins as .dylib, rpath @loader_path/plugins
+- Linux (gcc): plugins as .so, rpath $ORIGIN/plugins, link -ldl
+
+Usage
+
+1. ./build.sh
+2. ./build/pipeline name1,name2,... < input.txt
+
+Bounded Queue
+
+- Mutex + two condition variables, closeable
+- Sentinel: literal string "<END>" propagated exactly once
+
+Plugins
+
+- logger: append to output/pipeline.log
+- typewriter: optional per-char delay via env TYPEWRITER_DELAY_US (microseconds)
+- uppercaser: to upper
+- rotator: Caesar rotation via env ROTATE_N (default 13)
+- flipper: reverse string
+- expander: collapse spaces/tabs, trim ends
+
+Environment
+
+- TYPEWRITER_DELAY_US=1000 ROTATE_N=5 ./build/pipeline logger,uppercaser
+
+Example with sink_stdout
+
+echo "Hello World" | ./build/pipeline uppercaser,sink_stdout
