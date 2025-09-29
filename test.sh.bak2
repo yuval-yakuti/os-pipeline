@@ -26,30 +26,25 @@ if [[ "${last_line}" != "hello world" ]]; then
 fi
 pass "logger"
 
-# 2) uppercaser (logger -> file)
-: > output/pipeline.log
+# 2) uppercaser (use sink_stdout for explicit stdout capture)
 out="$(echo "Hello World" | ./build/pipeline uppercaser,logger >/dev/null 2>&1; tail -n 1 output/pipeline.log)"
 if [[ "${out}" != "HELLO WORLD" ]]; then
   fail "uppercaser: expected 'HELLO WORLD', got '${out}'"
 fi
 pass "uppercaser"
-
-# 3) rotator rotate-right-by-one (assert via logger; robust under runner)
-: > output/pipeline.log
-printf "Abc XyZ\n" | ./build/pipeline rotator,logger >/dev/null 2>rot.err
-out="$(tail -n 1 output/pipeline.log 2>/dev/null || true)"
+# 3) rotator rotate-right-by-one (per spec)
+out="$(printf "Abc XyZ
+<END>
+" | ./build/pipeline rotator,logger >/dev/null 2>&1; tail -n 1 output/pipeline.log)"
 if [[ "${out}" != "ZAbc Xy" ]]; then
-  echo '--- rot.err ---'
-  cat rot.err 2>/dev/null || true
-  echo '--- log tail ---'
-  tail -n 5 output/pipeline.log 2>/dev/null || true
   fail "rotator: expected 'ZAbc Xy', got '${out}'"
 fi
 pass "rotator"
 
+
+
 # 4) expander→uppercaser→flipper
-: > output/pipeline.log
-out="$(printf "abc\n" | ./build/pipeline expander,uppercaser,flipper,logger >/dev/null 2>&1; tail -n 1 output/pipeline.log)"
+out="$(printf "  a\t  b   c  \n" | ./build/pipeline expander,uppercaser,flipper,logger >/dev/null 2>&1; tail -n 1 output/pipeline.log)"
 if [[ "${out}" != "C B A" ]]; then
   fail "expander,uppercaser,flipper: expected 'C B A', got '${out}'"
 fi
@@ -91,7 +86,7 @@ pass "missing plugin error message"
 # 9) long line (100k chars): ensure non-empty output and safe newline trim
 # Generate using Python for portability
 long_len=100000
-out_len=$(python3 -c "print('a'*${long_len})" | ./build/pipeline uppercaser,sink_stdout | wc -c)
+out_len=$(python3 -c "print('a'*${long_len})" | ./build/pipeline expander,uppercaser,sink_stdout | wc -c)
 if [[ ${out_len} -le 0 ]]; then
   fail "long line: expected non-empty output, got length ${out_len}"
 fi

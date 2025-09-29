@@ -7,76 +7,78 @@
 #include "plugin_sdk.h"
 #include "util.h"
 
-typedef struct exp_ctx { plugin_context base; } exp_ctx;
+typedef struct exp_state {
+    string_bq *q;
+    pthread_t thread;
+    const char* (*next_place)(const char*);
+} exp_state;
 
-static char *collapse_and_trim(const char *s) {
-    const char *p = s;
-    // skip leading spaces/tabs
-    while (*p == ' ' || *p == '\t') p++;
-    size_t len = strlen(p);
-    char *tmp = (char *)malloc(len + 1);
-    if (!tmp) return NULL;
+static exp_state G = {0};
+
+static char *insert_spaces_dup(const char *s) {
+    size_t len = strlen(s);
+    if (len == 0) return dup_cstr("");
+    // Worst case: char + space for all but last => 2*len - 1 + NUL <= 2*len
+    char *o = (char *)malloc(len * 2);
+    if (!o) return NULL;
     size_t j = 0;
-    int in_space = 0;
-    for (size_t i = 0; p[i] != '\0'; ++i) {
-        char c = p[i];
-        if (c == ' ' || c == '\t') {
-            if (!in_space) {
-                tmp[j++] = ' ';
-                in_space = 1;
-            }
-        } else {
-            tmp[j++] = c;
-            in_space = 0;
-        }
+    for (size_t i = 0; i < len; ++i) {
+        o[j++] = s[i];
+        if (i + 1 < len) o[j++] = ' ';
     }
-    // trim trailing space
-    if (j > 0 && tmp[j - 1] == ' ') j--;
-    tmp[j] = '\0';
-    // shrink to fit
-    char *out = (char *)realloc(tmp, j + 1);
-    return out ? out : tmp;
+    o[j] = '\0';
+    return o;
 }
 
 static void *worker(void *arg) {
-    exp_ctx *ctx = (exp_ctx *)arg;
+    (void)arg;
     char *s = NULL;
-    while (bq_pop(ctx->base.in_q, &s) == 0) {
-        if (s == BQ_END_SENTINEL) { bq_push(ctx->base.out_q, s); break; }
-        char *o = collapse_and_trim(s);
+    while (bq_pop(G.q, &s) == 0) {
+        if (s == BQ_END_SENTINEL || (s && strcmp(s, "<END>") == 0)) {
+            if (G.next_place) (void)G.next_place(BQ_END_SENTINEL);
+            break;
+        }
+        char *o = insert_spaces_dup(s);
         free(s);
         if (!o) continue;
-        bq_push(ctx->base.out_q, o);
+        if (G.next_place) (void)G.next_place(o);
+        free(o);
     }
     return NULL;
 }
 
-int plugin_init(plugin_context **ctx_out) {
-    if (!ctx_out) return -1;
-    exp_ctx *ctx = (exp_ctx *)calloc(1, sizeof(exp_ctx));
-    if (!ctx) return -1;
-    *ctx_out = (plugin_context *)ctx;
-    return 0;
+const char* plugin_get_name(void) { return "expander"; }
+
+const char* plugin_init(int queue_size) {
+    if (queue_size <= 0) queue_size = 128;
+    G.q = bq_create((size_t)queue_size);
+    if (!G.q) return "expander: queue create failed";
+    if (pthread_create(&G.thread, NULL, worker, NULL) != 0) return "expander: thread create failed";
+    return NULL;
 }
 
-int attach(plugin_context *ctx_base, string_bq *in_q, string_bq *out_q) {
-    exp_ctx *ctx = (exp_ctx *)ctx_base;
-    ctx->base.in_q = in_q;
-    ctx->base.out_q = out_q;
-    return pthread_create(&ctx->base.thread, NULL, worker, ctx);
+void plugin_attach(const char* (*next_place_work)(const char*)) { G.next_place = next_place_work; }
+
+const char* plugin_place_work(const char* str) {
+    if (!G.q) return "expander: not initialized";
+    if (str == BQ_END_SENTINEL || (str && strcmp(str, "<END>") == 0)) {
+        return bq_push(G.q, (char *)BQ_END_SENTINEL) == 0 ? NULL : "expander: push failed";
+    }
+    char *dup = dup_cstr(str ? str : "");
+    if (!dup) return "expander: OOM";
+    return bq_push(G.q, dup) == 0 ? NULL : "expander: push failed";
 }
 
-int place_work(plugin_context *ctx_base, char *line) {
-    exp_ctx *ctx = (exp_ctx *)ctx_base;
-    return bq_push(ctx->base.in_q, line);
+const char* plugin_fini(void) {
+    if (G.q) bq_close(G.q);
+    return NULL;
 }
 
-void shutdown(plugin_context *ctx_base) { (void)ctx_base; }
-void plugin_wait(plugin_context *ctx_base) __attribute__((visibility("default"))) __asm__("wait");
-void plugin_wait(plugin_context *ctx_base) { exp_ctx *ctx = (exp_ctx *)ctx_base; pthread_join(ctx->base.thread, NULL); free(ctx); }
-
-// New ABI names (thin wrappers)
-void plugin_fini(plugin_context *ctx) { shutdown(ctx); }
-void plugin_wait_finished(plugin_context *ctx) { plugin_wait(ctx); }
+const char* plugin_wait_finished(void) {
+    if (G.thread) pthread_join(G.thread, NULL);
+    if (G.q) { bq_destroy(G.q); G.q = NULL; }
+    G.next_place = NULL;
+    return NULL;
+}
 
 

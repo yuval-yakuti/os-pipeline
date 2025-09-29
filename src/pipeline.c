@@ -9,16 +9,24 @@
 #include <unistd.h>
 
 #include "bq.h"
-#include "plugin_sdk.h"
 #include "util.h"
+
+typedef const char* (*fn_get_name)(void);
+typedef const char* (*fn_init)(int);
+typedef const char* (*fn_place)(const char*);
+typedef void        (*fn_attach)(const char* (*)(const char*));
+typedef const char* (*fn_fini)(void);
+typedef const char* (*fn_wait)(void);
 
 typedef struct loaded_plugin {
     void *handle;
-    plugin_api api;
-    plugin_context *ctx;
-    string_bq *in_q;
-    string_bq *out_q;
     char name[64];
+    fn_get_name get_name;
+    fn_init init;
+    fn_place place_work;
+    fn_attach attach;
+    fn_fini fini;
+    fn_wait wait_finished;
 } loaded_plugin;
 
 static void *load_symbol(void *handle, const char *sym) {
@@ -32,27 +40,7 @@ static void *load_symbol(void *handle, const char *sym) {
     return fn;
 }
 
-static int setup_plugin(loaded_plugin *lp) {
-    if (lp->api.plugin_init(&lp->ctx) != 0) {
-        LOG_ERR("%s: plugin_init failed", lp->name);
-        return -1;
-    }
-    if (lp->api.attach(lp->ctx, lp->in_q, lp->out_q) != 0) {
-        LOG_ERR("%s: attach failed", lp->name);
-        return -1;
-    }
-    return 0;
-}
-
-static void shutdown_plugin(loaded_plugin *lp) {
-    if (!lp) return;
-    if (lp->api.shutdown && lp->ctx) lp->api.shutdown(lp->ctx);
-}
-
-static void wait_plugin(loaded_plugin *lp) {
-    if (!lp) return;
-    if (lp->api.wait && lp->ctx) lp->api.wait(lp->ctx);
-}
+// New SDK has init/fini/wait on plain functions, no opaque ctx here.
 
 static char *next_token(char **p) {
     if (!p || !*p) return NULL;
@@ -120,26 +108,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Create queues: one between each adjacent stage
     const size_t Q_CAP = 128;
-    string_bq **queues = (string_bq **)calloc(num + 1, sizeof(string_bq *));
-    if (!queues) {
-        LOG_ERR("OOM");
-        free(plugins);
-        free(spec);
-        return 1;
-    }
-    for (size_t i = 0; i < num + 1; ++i) {
-        queues[i] = bq_create(Q_CAP);
-        if (!queues[i]) {
-            LOG_ERR("Failed creating queue %zu", i);
-            for (size_t j = 0; j < i; ++j) bq_destroy(queues[j]);
-            free(queues);
-            free(plugins);
-            free(spec);
-            return 1;
-        }
-    }
 
     // Load each plugin
     char *cursor = spec;
@@ -150,9 +119,6 @@ int main(int argc, char **argv) {
             return 1;
         }
         snprintf(plugins[i].name, sizeof(plugins[i].name), "%s", tok);
-        plugins[i].in_q = queues[i];
-        plugins[i].out_q = queues[i + 1];
-
         // Build full path to module
         char so_path[256];
 #if defined(__APPLE__)
@@ -165,22 +131,30 @@ int main(int argc, char **argv) {
             LOG_ERR("dlopen failed for %s: %s", so_path, dlerror());
             return 1;
         }
-        plugins[i].api.plugin_init = (int (*)(plugin_context **))load_symbol(plugins[i].handle, PLUGIN_FN_INIT);
-        plugins[i].api.attach = (int (*)(plugin_context *, string_bq *, string_bq *))load_symbol(plugins[i].handle, PLUGIN_FN_ATTACH);
-        plugins[i].api.place_work = (int (*)(plugin_context *, char *))load_symbol(plugins[i].handle, PLUGIN_FN_PLACE_WORK);
-        plugins[i].api.shutdown = (void (*)(plugin_context *))load_symbol(plugins[i].handle, PLUGIN_FN_SHUTDOWN);
-        plugins[i].api.wait = (void (*)(plugin_context *))load_symbol(plugins[i].handle, PLUGIN_FN_WAIT);
-        if (!plugins[i].api.plugin_init || !plugins[i].api.attach || !plugins[i].api.place_work || !plugins[i].api.shutdown || !plugins[i].api.wait) {
+        plugins[i].get_name = (fn_get_name)load_symbol(plugins[i].handle, "plugin_get_name");
+        plugins[i].init = (fn_init)load_symbol(plugins[i].handle, "plugin_init");
+        plugins[i].place_work = (fn_place)load_symbol(plugins[i].handle, "plugin_place_work");
+        plugins[i].attach = (fn_attach)load_symbol(plugins[i].handle, "plugin_attach");
+        plugins[i].fini = (fn_fini)load_symbol(plugins[i].handle, "plugin_fini");
+        plugins[i].wait_finished = (fn_wait)load_symbol(plugins[i].handle, "plugin_wait_finished");
+        if (!plugins[i].init || !plugins[i].place_work || !plugins[i].attach || !plugins[i].fini || !plugins[i].wait_finished) {
             LOG_ERR("%s: missing required symbols", tok);
             return 1;
         }
-        if (setup_plugin(&plugins[i]) != 0) return 1;
+        if (plugins[i].get_name) {
+            const char *nm = plugins[i].get_name();
+            if (nm && *nm) snprintf(plugins[i].name, sizeof(plugins[i].name), "%s", nm);
+        }
+        const char *err = plugins[i].init((int)Q_CAP);
+        if (err) { LOG_ERR("%s: init failed: %s", plugins[i].name[0] ? plugins[i].name : tok, err); return 1; }
     }
 
-    // Start sink consuming the last queue to avoid leaks and print results
-    pthread_t sink_thread;
-    sink_ctx sctx = { .q = queues[num] };
-    pthread_create(&sink_thread, NULL, sink_worker, &sctx);
+    // Wire callbacks in order
+    for (size_t i = 0; i + 1 < num; ++i) {
+        LOG_INFO("attach %s -> %s", plugins[i].name, plugins[i+1].name);
+        plugins[i].attach(plugins[i + 1].place_work);
+    }
+    if (num > 0) { LOG_INFO("attach %s -> (end)", plugins[num-1].name); plugins[num - 1].attach(NULL); }
 
     // Read stdin and feed first plugin via its input queue by place_work()
     char *line = NULL;
@@ -192,42 +166,25 @@ int main(int argc, char **argv) {
             line[len - 1] = '\0';
             len--;
         }
-        // send to first plugin
-        if (plugins[0].api.place_work(plugins[0].ctx, line) != 0) {
-            LOG_ERR("place_work failed in %s", plugins[0].name);
-            free(line);
-            line = NULL;
-            break;
-        }
-        line = NULL; // ownership transferred; allocate new buffer next getline
+        const char *err = plugins[0].place_work(line);
+        free(line);
+        line = NULL;
+        if (err) { LOG_ERR("place_work failed in %s: %s", plugins[0].name, err); break; }
     }
     free(line);
 
     // Signal end-of-stream once to the first plugin
-    plugins[0].api.place_work(plugins[0].ctx, (char *)BQ_END_SENTINEL);
+    (void)plugins[0].place_work(BQ_END_SENTINEL);
 
-    // Shutdown/wait plugins
-    for (size_t i = 0; i < num; ++i) {
-        shutdown_plugin(&plugins[i]);
-    }
-    for (size_t i = 0; i < num; ++i) {
-        wait_plugin(&plugins[i]);
-    }
-
-    // Ensure the final queue is closed to unblock sink if the last plugin is a sink
-    bq_close(queues[num]);
-    // Wait for sink to finish
-    pthread_join(sink_thread, NULL);
+    // Wait for all plugins to finish processing before finalizing
+    for (size_t i = 0; i < num; ++i) (void)plugins[i].wait_finished();
+    for (size_t i = 0; i < num; ++i) (void)plugins[i].fini();
 
     for (size_t i = 0; i < num; ++i) {
         if (plugins[i].handle) dlclose(plugins[i].handle);
     }
 
-    for (size_t i = 0; i < num + 1; ++i) {
-        bq_close(queues[i]);
-        bq_destroy(queues[i]);
-    }
-    free(queues);
+    
     free(plugins);
     free(spec);
     return 0;

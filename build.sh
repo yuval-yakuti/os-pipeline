@@ -28,7 +28,7 @@ else
 fi
 
 echo "Building core pipeline..."
-$CC $CFLAGS -Isrc \
+$CC $CFLAGS -Isrc -Iplugins \
   "$SRC_DIR/bq.c" "$SRC_DIR/pipeline.c" \
   -o "$BUILD_DIR/pipeline" $LDFLAGS $dlflag $rpath ${EXPORT_MAIN:-}
 
@@ -37,7 +37,7 @@ build_plugin() {
   src="$SRC_DIR/plugins/$1.c"
   out="$PLUG_DIR/$1.$ext"
   echo "Building plugin $name -> $out"
-  $CC $CFLAGS -Isrc $PLUGIN_LDFLAGS "$src" -o "$out" $LDFLAGS ${dlflag:-}
+  $CC $CFLAGS -Isrc -Iplugins $PLUGIN_LDFLAGS "$src" -o "$out" $LDFLAGS ${dlflag:-}
 }
 
 build_plugin logger
