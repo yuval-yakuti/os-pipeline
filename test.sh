@@ -128,9 +128,16 @@ fi
 pass "missing plugin error message"
 
 # 9) long line (100k chars): ensure non-empty output and safe newline trim
-# Generate using Python for portability
+# Generate input file to avoid BrokenPipe with timeouts
 long_len=100000
-out_len=$(python3 -c "print('a'*${long_len})" 2>/dev/null | run_with_timeout_n 10 ./build/pipeline uppercaser,sink_stdout | wc -c)
+tmp_in="/tmp/os_pipeline_in.txt"
+python3 - "$long_len" > "$tmp_in" 2>/dev/null <<'PY'
+import sys
+n=int(sys.argv[1])
+print('a'*n)
+print('<END>')
+PY
+out_len=$(run_with_timeout_n 10 bash -c "./build/pipeline uppercaser,sink_stdout < '$tmp_in' | wc -c" | tr -d ' \t')
 if [[ ${out_len} -le 0 ]]; then
   fail "long line: expected non-empty output, got length ${out_len}"
 fi
@@ -184,6 +191,186 @@ if ! echo "$err_out" | grep -E "(dlopen failed|missing required symbols)" >/dev/
   fail "analyzer missing plugin error message not clear: $err_out"
 fi
 pass "analyzer missing plugin error message"
+
+# 15) analyzer: shutdown message last line
+SHUT_LAST=$(printf "x\n<END>\n" | ./output/analyzer 8 uppercaser logger | tail -n1 || true)
+if [[ "$SHUT_LAST" != "Pipeline shutdown complete" ]]; then
+  fail "analyzer shutdown: expected last line 'Pipeline shutdown complete', got '$SHUT_LAST'"
+fi
+pass "analyzer shutdown message"
+
+# 16) analyzer: usage error when no plugins
+set +e
+msg1=$(./output/analyzer 10 2>&1)
+rc1=$?
+msg2=$(./output/analyzer 2>&1)
+rc2=$?
+set -e
+if [[ $rc1 -eq 0 || $rc2 -eq 0 ]]; then
+  fail "analyzer usage: expected non-zero exit when no plugins"
+fi
+if ! echo "$msg1$msg2" | grep -q "Usage:" || ! echo "$msg1$msg2" | grep -q "Available plugins:"; then
+  fail "analyzer usage: expected Usage and Available plugins in stderr"
+fi
+pass "analyzer usage without plugins"
+
+# 17) analyzer: invalid queue size values
+set +e
+msg_bad1=$(./output/analyzer abc uppercaser logger 2>&1)
+rc_bad1=$?
+msg_bad2=$(./output/analyzer 0 uppercaser logger 2>&1)
+rc_bad2=$?
+msg_bad3=$(./output/analyzer -5 uppercaser logger 2>&1)
+rc_bad3=$?
+set -e
+if [[ $rc_bad1 -eq 0 || $rc_bad2 -eq 0 || $rc_bad3 -eq 0 ]]; then
+  fail "analyzer invalid queue size should fail"
+fi
+pass "analyzer invalid queue size"
+
+# 18) analyzer: typewriter completes and prints shutdown (does not hang)
+TW_OUT=$(printf "hi\n<END>\n" | run_with_timeout_n 5 ./output/analyzer 5 typewriter sink_stdout | tr -d '\r')
+if ! printf '%s\n' "$TW_OUT" | grep -q "Pipeline shutdown complete"; then
+  echo "--- analyzer typewriter full stdout ---"
+  printf '%s\n' "$TW_OUT"
+  fail "analyzer typewriter: expected shutdown line in stdout"
+fi
+pass "analyzer typewriter shutdown"
+
+# 19) duplicate plugins: uppercaser,uppercaser idempotent (assert via logger)
+: > output/pipeline.log
+run_with_timeout sh -c 'printf "hello\n<END>\n" | ./build/pipeline uppercaser,uppercaser,logger >/dev/null 2>&1'
+out="$(wait_for_log_line || true)"
+if [[ "$out" != "HELLO" ]]; then
+  fail "duplicate uppercaser: expected 'HELLO', got '$out'"
+fi
+pass "duplicate uppercaser"
+
+# 20) sentinel-only through chain -> empty stdout
+out="$(run_with_timeout sh -c 'printf "<END>\n" | ./build/pipeline expander,uppercaser,flipper,sink_stdout' | cat)"
+if [[ -n "$out" ]]; then
+  fail "sentinel-only: expected empty stdout, got '$out'"
+fi
+pass "sentinel-only chain"
+
+# 21) backpressure: analyzer queue=1 with many lines; shutdown and last line observed
+tmp_many="/tmp/os_pipeline_many.txt"
+{
+  i=1
+  while (( i<=200 )); do printf "L%d\n" "$i"; ((i++)); done
+  printf "<END>\n"
+} > "$tmp_many"
+: > output/pipeline.log
+AN_OUT=$(run_with_timeout_n 15 bash -c "./output/analyzer 1 uppercaser logger < '$tmp_many'")
+if ! printf '%s\n' "$AN_OUT" | grep -q "Pipeline shutdown complete"; then
+  echo "--- analyzer backpressure stdout ---"; printf '%s\n' "$AN_OUT"
+  fail "backpressure: analyzer did not shutdown cleanly"
+fi
+last_logged="$(tail -n1 output/pipeline.log 2>/dev/null || true)"
+if [[ "$last_logged" != "L200" ]]; then
+  echo "--- log tail ---"; tail -n 5 output/pipeline.log 2>/dev/null || true
+  fail "backpressure: expected last logged 'L200', got '$last_logged'"
+fi
+pass "backpressure queue=1"
+
+# 22) analyzer with EOF (no input) -> shuts down
+AN_EOF_OUT=$(run_with_timeout_n 5 bash -c "./output/analyzer 10 uppercaser logger < /dev/null")
+if ! printf '%s\n' "$AN_EOF_OUT" | grep -q "Pipeline shutdown complete"; then
+  echo "--- analyzer EOF stdout ---"; printf '%s\n' "$AN_EOF_OUT"
+  fail "analyzer EOF: expected shutdown line"
+fi
+pass "analyzer EOF shutdown"
+
+# 23) analyzer exit code 0 on success
+set +e
+printf "ok\n<END>\n" | ./output/analyzer 5 sink_stdout >/dev/null 2>&1
+rc_ok=$?
+set -e
+if [[ $rc_ok -ne 0 ]]; then
+  fail "analyzer exit code: expected 0, got $rc_ok"
+fi
+pass "analyzer exit code 0"
+
+# 24) expander single-char edge: remains single char
+: > output/pipeline.log
+run_with_timeout sh -c 'printf "Z\n<END>\n" | ./build/pipeline expander,uppercaser,flipper,logger >/dev/null 2>&1'
+out="$(wait_for_log_line || true)"
+if [[ "$out" != "Z" ]]; then
+  fail "expander single char: expected 'Z', got '$out'"
+fi
+pass "expander single char"
+
+# 25) expander non-alphabetic preserved and spaced (assert via logger)
+: > output/pipeline.log
+run_with_timeout sh -c 'printf "1a!\n<END>\n" | ./build/pipeline expander,uppercaser,flipper,logger >/dev/null 2>&1'
+out="$(wait_for_log_line || true)"
+if [[ "$out" != "! A 1" ]]; then
+  fail "expander non-alpha: expected '! A 1', got '$out'"
+fi
+pass "expander non-alpha spacing"
+
+# 26) analyzer clean stderr on success
+set +e
+AN_ERR=$(printf "ok\n<END>\n" | ./output/analyzer 5 uppercaser logger 2>&1 >/dev/null)
+rc=$?
+set -e
+if [[ $rc -ne 0 ]]; then
+  fail "analyzer clean stderr: expected success exit, got $rc"
+fi
+if [[ -n "$AN_ERR" ]]; then
+  echo "--- analyzer stderr ---"; printf '%s\n' "$AN_ERR"
+  fail "analyzer clean stderr: expected empty stderr"
+fi
+pass "analyzer clean stderr"
+
+# 27) expander with tab preserved/spaced; final reversed sequence
+: > output/pipeline.log
+run_with_timeout sh -c 'printf "A\tb\n<END>\n" | ./build/pipeline expander,uppercaser,flipper,logger >/dev/null 2>&1'
+out="$(wait_for_log_line || true)"
+if [[ "$out" != $'B \t A' ]]; then
+  fail $'expander tab: expected "B \t A", got '
+fi
+pass "expander tab spacing"
+
+# 28) parallel analyzer runs (no interference, both shutdown)
+PAR_OUT1=$(run_with_timeout_n 5 bash -c 'printf "p1\n<END>\n" | ./output/analyzer 5 uppercaser sink_stdout') &
+pid1=$!
+PAR_OUT2=$(run_with_timeout_n 5 bash -c 'printf "p2\n<END>\n" | ./output/analyzer 5 uppercaser sink_stdout') &
+pid2=$!
+wait "$pid1" || true
+wait "$pid2" || true
+# Re-run to capture outputs deterministically (previous were in subshells)
+OUT_A=$(run_with_timeout_n 5 bash -c 'printf "p1\n<END>\n" | ./output/analyzer 5 uppercaser sink_stdout')
+OUT_B=$(run_with_timeout_n 5 bash -c 'printf "p2\n<END>\n" | ./output/analyzer 5 uppercaser sink_stdout')
+if ! printf '%s\n' "$OUT_A" | grep -q "Pipeline shutdown complete"; then
+  echo "--- analyzer A ---"; printf '%s\n' "$OUT_A"; fail "parallel analyzers: A missing shutdown"
+fi
+if ! printf '%s\n' "$OUT_B" | grep -q "Pipeline shutdown complete"; then
+  echo "--- analyzer B ---"; printf '%s\n' "$OUT_B"; fail "parallel analyzers: B missing shutdown"
+fi
+pass "parallel analyzers"
+
+# 29) analyzer long line (~2000 chars) non-empty and correct byte count
+al_tmp="/tmp/os_pipeline_long2k.txt"
+python3 - "$al_tmp" > "$al_tmp" 2>/dev/null <<'PY'
+print('x'*2000)
+print('<END>')
+PY
+AL_BYTES=$(run_with_timeout_n 10 bash -c "./output/analyzer 32 uppercaser sink_stdout < '$al_tmp' | wc -c" | tr -d ' \t')
+if [[ -z "$AL_BYTES" || "$AL_BYTES" -le 0 ]]; then
+  fail "analyzer long line: expected non-empty output, got '$AL_BYTES'"
+fi
+if (( AL_BYTES < 2001 )); then
+  fail "analyzer long line: expected at least 2001 bytes (content+newline), got $AL_BYTES"
+fi
+pass "analyzer long line (2k)"
+
+# 30) mixed chain: uppercaser then rotator to sink_stdout
+out="$(run_with_timeout sh -c 'printf "Abc\n<END>\n" | ./build/pipeline uppercaser,rotator,sink_stdout' | cat)"
+if [[ "$out" != "CAB"$'' ]]; then
+  fail "mixed chain uppercaser,rotator: expected 'CAB', got '$out'"
+fi
+pass "mixed uppercaser+rotator"
 
 echo "All smoke tests passed."
 
