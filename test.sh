@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Disable job control notifications to avoid 'Terminated: 15' lines
+set +m
 
 cd "$(dirname "$0")"
 
@@ -11,8 +13,26 @@ run_with_timeout() {
   ( "$@" ) & p=$!
   ( sleep 3; kill -0 "$p" 2>/dev/null && kill "$p" >/dev/null 2>&1 || true ) >/dev/null 2>&1 &
   w=$!
-  wait "$p" || true
+  disown "$w" 2>/dev/null || true
+  # Preserve child exit status (do not mask with || true)
+  set +e
+  wait "$p"
   rc=$?
+  set -e
+  kill "$w" >/dev/null 2>&1 || true
+  return $rc
+}
+
+# Timeout helper with custom seconds: run_with_timeout_n SECONDS cmd...
+run_with_timeout_n() {
+  local secs="$1"; shift
+  ( "$@" ) & p=$!
+  ( sleep "$secs"; kill -0 "$p" 2>/dev/null && kill "$p" >/dev/null 2>&1 || true ) >/dev/null 2>&1 &
+  w=$!
+  disown "$w" 2>/dev/null || true
+  set +e
+  wait "$p"; rc=$?
+  set -e
   kill "$w" >/dev/null 2>&1 || true
   return $rc
 }
@@ -110,7 +130,7 @@ pass "missing plugin error message"
 # 9) long line (100k chars): ensure non-empty output and safe newline trim
 # Generate using Python for portability
 long_len=100000
-out_len=$(python3 -c "print('a'*${long_len})" | run_with_timeout ./build/pipeline uppercaser,sink_stdout | wc -c)
+out_len=$(python3 -c "print('a'*${long_len})" 2>/dev/null | run_with_timeout_n 10 ./build/pipeline uppercaser,sink_stdout | wc -c)
 if [[ ${out_len} -le 0 ]]; then
   fail "long line: expected non-empty output, got length ${out_len}"
 fi
