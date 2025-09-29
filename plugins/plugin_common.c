@@ -1,40 +1,151 @@
+#include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
 #include "plugin_common.h"
 
-int plugin_node_init(plugin_node *n, int queue_size, void *(*worker)(void *)) {
-    if (!n) return -1;
-    if (queue_size <= 0) queue_size = 128;
-    n->queue = bq_create((size_t)queue_size);
-    if (!n->queue) return -1;
-    if (pthread_create(&n->thread, NULL, worker, n) != 0) return -1;
-    return 0;
+#define END_TOKEN "<END>"
+
+static int is_end_token(const char* str) {
+    return str && strcmp(str, END_TOKEN) == 0;
 }
 
-void plugin_node_attach(plugin_node *n, const char* (*next_place)(const char*)) { n->next_place = next_place; }
+void log_error(plugin_context_t* ctx, const char* message) {
+    const char* name = ctx && ctx->name ? ctx->name : "plugin";
+    fprintf(stderr, "[ERROR][%s] - %s\n", name, message ? message : "unknown error");
+}
 
-const char* plugin_node_place_work(plugin_node *n, const char *str) {
-    if (!n || !n->queue) return "plugin_node: not initialized";
-    if (str == BQ_END_SENTINEL || (str && strcmp(str, "<END>") == 0)) {
-        return bq_push(n->queue, (char *)BQ_END_SENTINEL) == 0 ? NULL : "plugin_node: push failed";
+void log_info(plugin_context_t* ctx, const char* message) {
+    const char* name = ctx && ctx->name ? ctx->name : "plugin";
+    fprintf(stderr, "[INFO][%s] - %s\n", name, message ? message : "info");
+}
+
+void* plugin_consumer_thread(void* arg) {
+    plugin_context_t* ctx = (plugin_context_t*)arg;
+    if (!ctx) {
+        return NULL;
     }
-    const char *s = str ? str : "";
-    size_t len = strlen(s);
-    char *dup = (char *)malloc(len + 1);
-    if (!dup) return "plugin_node: OOM";
-    memcpy(dup, s, len + 1);
-    return bq_push(n->queue, dup) == 0 ? NULL : "plugin_node: push failed";
-}
 
-const char* plugin_node_fini(plugin_node *n) { if (n && n->queue) bq_close(n->queue); return NULL; }
+    for (;;) {
+        char* item = consumer_producer_get(&ctx->queue);
+        if (!item) {
+            break; /* queue drained and closed */
+        }
 
-const char* plugin_node_wait(plugin_node *n) {
-    if (!n) return NULL;
-    pthread_join(n->thread, NULL);
-    if (n->queue) { bq_destroy(n->queue); n->queue = NULL; }
-    n->next_place = NULL;
-    n->transform = NULL;
+        if (is_end_token(item)) {
+            if (ctx->next_place_work) {
+                const char* err = ctx->next_place_work(END_TOKEN);
+                if (err) {
+                    log_error(ctx, err);
+                }
+            }
+            break;
+        }
+
+        char* processed = item;
+        if (ctx->process_function) {
+            processed = ctx->process_function(item);
+        }
+
+        if (!processed) {
+            /* Drop the string if plugin chose to consume it */
+            free(item);
+            continue;
+        }
+
+        if (processed != item) {
+            free(item);
+        }
+
+        if (ctx->next_place_work) {
+            const char* err = ctx->next_place_work(processed);
+            if (err) {
+                log_error(ctx, err);
+            }
+        }
+
+        free(processed);
+    }
+
+    consumer_producer_signal_finished(&ctx->queue);
+    ctx->thread_running = 0;
+    ctx->finished = 1;
     return NULL;
 }
 
+const char* common_plugin_init(plugin_context_t* ctx,
+                               plugin_process_fn process,
+                               const char* name,
+                               int queue_size) {
+    if (!ctx || queue_size <= 0) {
+        return "common_plugin_init: invalid arguments";
+    }
+    if (ctx->initialized) {
+        return "common_plugin_init: already initialized";
+    }
 
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->name = name ? name : "plugin";
+    ctx->process_function = process;
+
+    const char* err = consumer_producer_init(&ctx->queue, queue_size);
+    if (err) {
+        return err;
+    }
+
+    ctx->initialized = 1;
+    ctx->thread_running = 1;
+    if (pthread_create(&ctx->consumer_thread, NULL, plugin_consumer_thread, ctx) != 0) {
+        ctx->initialized = 0;
+        ctx->thread_running = 0;
+        consumer_producer_destroy(&ctx->queue);
+        return "common_plugin_init: pthread_create failed";
+    }
+    return NULL;
+}
+
+void common_plugin_attach(plugin_context_t* ctx, const char* (*next_place)(const char*)) {
+    if (!ctx) {
+        return;
+    }
+    ctx->next_place_work = next_place;
+}
+
+const char* common_plugin_place_work(plugin_context_t* ctx, const char* str) {
+    if (!ctx || !ctx->initialized) {
+        return "common_plugin_place_work: plugin not initialized";
+    }
+    if (!str) {
+        str = "";
+    }
+    return consumer_producer_put(&ctx->queue, str);
+}
+
+const char* common_plugin_wait_finished(plugin_context_t* ctx) {
+    if (!ctx || !ctx->initialized) {
+        return NULL;
+    }
+    if (!ctx->finished) {
+        (void)consumer_producer_wait_finished(&ctx->queue);
+    }
+    if (ctx->thread_running) {
+        pthread_join(ctx->consumer_thread, NULL);
+        ctx->thread_running = 0;
+    }
+    ctx->finished = 1;
+    return NULL;
+}
+
+const char* common_plugin_fini(plugin_context_t* ctx) {
+    if (!ctx || !ctx->initialized) {
+        return NULL;
+    }
+
+    (void)common_plugin_wait_finished(ctx);
+    consumer_producer_destroy(&ctx->queue);
+    ctx->initialized = 0;
+    ctx->next_place_work = NULL;
+    ctx->process_function = NULL;
+    return NULL;
+}

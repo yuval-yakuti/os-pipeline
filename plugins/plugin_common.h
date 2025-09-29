@@ -1,25 +1,34 @@
-// Shared plugin infrastructure for queue/thread/callback wiring.
 #ifndef PLUGINS_PLUGIN_COMMON_H
 #define PLUGINS_PLUGIN_COMMON_H
 
 #include <pthread.h>
-#include "bq.h"
 
-typedef struct plugin_node {
-    string_bq *queue;
-    pthread_t thread;
-    const char* (*next_place)(const char*);
-    // transform callback provided by concrete plugin
-    // in: input C string, out: malloc'ed output or NULL to drop; sentinel handled by infra
-    char *(*transform)(const char *in);
-} plugin_node;
+#include "sync/consumer_producer.h"
 
-// Initialize queue and thread with provided worker function
-int plugin_node_init(plugin_node *n, int queue_size, void *(*worker)(void *));
-void plugin_node_attach(plugin_node *n, const char* (*next_place)(const char*));
-const char* plugin_node_place_work(plugin_node *n, const char *str);
-const char* plugin_node_fini(plugin_node *n);      // close queue
-const char* plugin_node_wait(plugin_node *n);      // join thread and destroy queue
+typedef char* (*plugin_process_fn)(char* input);
 
-#endif // PLUGINS_PLUGIN_COMMON_H
+typedef struct plugin_context_impl {
+    const char* name;                                      /* plugin name */
+    consumer_producer_t queue;                             /* inbound queue */
+    pthread_t consumer_thread;                             /* worker thread */
+    const char* (*next_place_work)(const char*);           /* next stage callback */
+    plugin_process_fn process_function;                    /* plugin-specific transform */
+    int initialized;                                       /* initialization flag */
+    int thread_running;                                    /* thread state */
+    int finished;                                          /* worker completion flag */
+} plugin_context_t;
 
+void*       plugin_consumer_thread(void* arg);
+void        log_error(plugin_context_t* ctx, const char* message);
+void        log_info(plugin_context_t* ctx, const char* message);
+
+const char* common_plugin_init(plugin_context_t* ctx,
+                               plugin_process_fn process,
+                               const char* name,
+                               int queue_size);
+const char* common_plugin_place_work(plugin_context_t* ctx, const char* str);
+void        common_plugin_attach(plugin_context_t* ctx, const char* (*next_place)(const char*));
+const char* common_plugin_wait_finished(plugin_context_t* ctx);
+const char* common_plugin_fini(plugin_context_t* ctx);
+
+#endif /* PLUGINS_PLUGIN_COMMON_H */

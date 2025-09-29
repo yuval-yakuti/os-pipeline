@@ -27,6 +27,29 @@ typedef struct plugin_handle_t {
     void *handle;
 } plugin_handle_t;
 
+static int copy_file(const char *src, const char *dst) {
+    FILE *in = fopen(src, "rb");
+    if (!in) return -1;
+    FILE *out = fopen(dst, "wb");
+    if (!out) {
+        fclose(in);
+        return -1;
+    }
+    char buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            fclose(in);
+            fclose(out);
+            return -1;
+        }
+    }
+    int err = ferror(in) ? -1 : 0;
+    fclose(in);
+    fclose(out);
+    return err;
+}
+
 static void print_usage(void) {
     printf("Usage: ./analyzer <queue_size> <plugin1> <plugin2> ... <pluginN>\n");
     printf("Arguments:\n");
@@ -77,17 +100,29 @@ int main(int argc, char **argv) {
     plugin_handle_t *plugins = (plugin_handle_t *)calloc((size_t)num, sizeof(plugin_handle_t));
     if (!plugins) { fprintf(stderr, "OOM\n"); return 1; }
 
+    (void)mkdir("build/plugins/instances", 0755);
+
     // Load plugins
     for (int i = 0; i < num; ++i) {
         const char *tok = argv[i + 2];
         snprintf(plugins[i].name, sizeof(plugins[i].name), "%s", tok);
         char so_path[256];
+        char inst_path[512];
 #if defined(__APPLE__)
-        snprintf(so_path, sizeof(so_path), "build/plugins/%s.dylib", tok);
+        const char *ext = ".dylib";
 #else
-        snprintf(so_path, sizeof(so_path), "build/plugins/%s.so", tok);
+        const char *ext = ".so";
 #endif
-        plugins[i].handle = dlopen(so_path, RTLD_NOW);
+        snprintf(so_path, sizeof(so_path), "build/plugins/%s%s", tok, ext);
+        snprintf(inst_path, sizeof(inst_path), "build/plugins/instances/%s_%d%s", tok, i, ext);
+        if (copy_file(so_path, inst_path) != 0) {
+            fprintf(stderr, "dlopen failed for %s: %s\n", so_path, strerror(errno));
+            print_usage();
+            free(plugins);
+            return 1;
+        }
+        plugins[i].handle = dlopen(inst_path, RTLD_NOW);
+        unlink(inst_path);
         if (!plugins[i].handle) {
             fprintf(stderr, "dlopen failed for %s: %s\n", so_path, dlerror());
             print_usage();
@@ -150,5 +185,3 @@ int main(int argc, char **argv) {
     printf("Pipeline shutdown complete\n");
     return 0;
 }
-
-

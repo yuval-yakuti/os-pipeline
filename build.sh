@@ -43,7 +43,12 @@ build_plugin() {
   src="$SRC_DIR/plugins/$1.c"
   out="$PLUG_DIR/$1.$ext"
   echo "Building plugin $name -> $out"
-  $CC $CFLAGS -Isrc -Iplugins $PLUGIN_LDFLAGS "$src" "$ROOT_DIR/plugins/plugin_common.c" -o "$out" $LDFLAGS ${dlflag:-}
+  $CC $CFLAGS -Isrc -Iplugins $PLUGIN_LDFLAGS \
+    "$src" \
+    "$ROOT_DIR/plugins/plugin_common.c" \
+    "$ROOT_DIR/plugins/sync/monitor.c" \
+    "$ROOT_DIR/plugins/sync/consumer_producer.c" \
+    -o "$out" $LDFLAGS ${dlflag:-}
 }
 
 build_plugin logger
@@ -55,4 +60,3 @@ build_plugin expander
 build_plugin sink_stdout
 
 echo "Done. Run: $OUT_DIR/analyzer <queue_size> <plugins...>"
-

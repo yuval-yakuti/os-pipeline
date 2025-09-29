@@ -29,6 +29,29 @@ typedef struct loaded_plugin {
     fn_wait wait_finished;
 } loaded_plugin;
 
+static int copy_file(const char *src, const char *dst) {
+    FILE *in = fopen(src, "rb");
+    if (!in) return -1;
+    FILE *out = fopen(dst, "wb");
+    if (!out) {
+        fclose(in);
+        return -1;
+    }
+    char buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            fclose(in);
+            fclose(out);
+            return -1;
+        }
+    }
+    int err = ferror(in) ? -1 : 0;
+    fclose(in);
+    fclose(out);
+    return err;
+}
+
 static void *load_symbol(void *handle, const char *sym) {
     dlerror();
     void *fn = dlsym(handle, sym);
@@ -62,26 +85,6 @@ static int mkdir_p(const char *path) {
     return mkdir(path, 0755);
 }
 
-typedef struct sink_ctx {
-    string_bq *q;
-} sink_ctx;
-
-static void *sink_worker(void *arg) {
-    sink_ctx *s = (sink_ctx *)arg;
-    char *line = NULL;
-    while (bq_pop(s->q, &line) == 0) {
-        if (line == BQ_END_SENTINEL || (line && strcmp(line, "<END>") == 0)) {
-            // Do not free sentinel; just break
-            break;
-        }
-        // Print to stdout
-        fprintf(stdout, "%s\n", line);
-        fflush(stdout);
-        free(line);
-    }
-    return NULL;
-}
-
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "Usage: %s name1,name2,...\n", argv[0]);
@@ -108,6 +111,8 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    (void)mkdir("build/plugins/instances", 0755);
+
     const size_t Q_CAP = 128;
 
     // Load each plugin
@@ -121,12 +126,20 @@ int main(int argc, char **argv) {
         snprintf(plugins[i].name, sizeof(plugins[i].name), "%s", tok);
         // Build full path to module
         char so_path[256];
+        char inst_path[512];
 #if defined(__APPLE__)
-        snprintf(so_path, sizeof(so_path), "build/plugins/%s.dylib", tok);
+        const char *ext = ".dylib";
 #else
-        snprintf(so_path, sizeof(so_path), "build/plugins/%s.so", tok);
+        const char *ext = ".so";
 #endif
-        plugins[i].handle = dlopen(so_path, RTLD_NOW);
+        snprintf(so_path, sizeof(so_path), "build/plugins/%s%s", tok, ext);
+        snprintf(inst_path, sizeof(inst_path), "build/plugins/instances/%s_%zu%s", tok, i, ext);
+        if (copy_file(so_path, inst_path) != 0) {
+            LOG_ERR("dlopen failed for %s: %s", so_path, strerror(errno));
+            return 1;
+        }
+        plugins[i].handle = dlopen(inst_path, RTLD_NOW);
+        unlink(inst_path);
         if (!plugins[i].handle) {
             LOG_ERR("dlopen failed for %s: %s", so_path, dlerror());
             return 1;
@@ -189,5 +202,3 @@ int main(int argc, char **argv) {
     free(spec);
     return 0;
 }
-
-

@@ -149,11 +149,19 @@ pass "long line (100k)"
 
 # 10) monitor unit test build & run
 cc_cmd="${CC:-cc}"
-${cc_cmd} -std=c11 -O2 -Wall -Wextra -Werror -pthread tests/monitor_test.c -o build/monitor_test
+${cc_cmd} -std=c11 -O2 -Wall -Wextra -Werror -pthread \
+  -Iplugins tests/monitor_test.c plugins/sync/monitor.c -o build/monitor_test
 run_with_timeout ./build/monitor_test >/dev/null 2>&1 || fail "monitor_test failed"
 pass "monitor unit test"
 
-# 11) analyzer: uppercaser -> logger basic
+# 11) consumer_producer queue unit test
+${cc_cmd} -std=c11 -O2 -Wall -Wextra -Werror -pthread \
+  -Iplugins tests/consumer_producer_test.c \
+  plugins/sync/monitor.c plugins/sync/consumer_producer.c -o build/consumer_producer_test
+run_with_timeout ./build/consumer_producer_test >/dev/null 2>&1 || fail "consumer_producer_test failed"
+pass "consumer_producer unit test"
+
+# 12) analyzer: uppercaser -> logger basic
 EXPECTED="[logger] HELLO"
 ACTUAL=$(printf "hello\n<END>\n" | ./output/analyzer 10 uppercaser logger | grep "\[logger\]" | head -n1 || true)
 if [[ "$ACTUAL" != "$EXPECTED" ]]; then
@@ -161,7 +169,7 @@ if [[ "$ACTUAL" != "$EXPECTED" ]]; then
 fi
 pass "analyzer uppercaser+logger"
 
-# 12) analyzer: empty string
+# 13) analyzer: empty string
 EXPECTED_EMPTY="[logger] "
 ACTUAL_EMPTY=$(printf "\n<END>\n" | ./output/analyzer 5 uppercaser logger | grep "\[logger\]" | head -n1 || true)
 if [[ "$ACTUAL_EMPTY" != "$EXPECTED_EMPTY" ]]; then
@@ -169,7 +177,7 @@ if [[ "$ACTUAL_EMPTY" != "$EXPECTED_EMPTY" ]]; then
 fi
 pass "analyzer empty string"
 
-# 13) analyzer: invalid args (missing queue size)
+# 14) analyzer: invalid args (missing queue size)
 set +e
 ./output/analyzer >/dev/null 2>&1
 rc=$?
@@ -179,7 +187,7 @@ if [[ $rc -eq 0 ]]; then
 fi
 pass "analyzer invalid-args"
 
-# 14) analyzer: missing plugin should fail
+# 15) analyzer: missing plugin should fail
 set +e
 err_out=$(./output/analyzer 10 this_plugin_should_not_exist 2>&1 >/dev/null)
 rc=$?
@@ -192,14 +200,14 @@ if ! echo "$err_out" | grep -E "(dlopen failed|missing required symbols)" >/dev/
 fi
 pass "analyzer missing plugin error message"
 
-# 15) analyzer: shutdown message last line
+# 16) analyzer: shutdown message last line
 SHUT_LAST=$(printf "x\n<END>\n" | ./output/analyzer 8 uppercaser logger | tail -n1 || true)
 if [[ "$SHUT_LAST" != "Pipeline shutdown complete" ]]; then
   fail "analyzer shutdown: expected last line 'Pipeline shutdown complete', got '$SHUT_LAST'"
 fi
 pass "analyzer shutdown message"
 
-# 16) analyzer: usage error when no plugins
+# 17) analyzer: usage error when no plugins
 set +e
 msg1=$(./output/analyzer 10 2>&1)
 rc1=$?
@@ -373,5 +381,3 @@ fi
 pass "mixed uppercaser+rotator"
 
 echo "All smoke tests passed."
-
-

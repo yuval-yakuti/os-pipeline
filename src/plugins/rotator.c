@@ -1,50 +1,44 @@
-#include <ctype.h>
-#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "bq.h"
-#include "plugin_sdk.h"
 #include "plugin_common.h"
-#include "util.h"
+#include "plugin_sdk.h"
 
-static plugin_node N;
+static plugin_context_t g_ctx;
 
-static char *rotate_right_by_one(const char *s) {
-    size_t len = strlen(s);
-    if (len == 0) return dup_cstr("");
-    char *o = (char *)malloc(len + 1);
-    if (!o) return NULL;
-    // last char to front, shift right by one
-    o[0] = s[len - 1];
-    for (size_t i = 0; i < len - 1; ++i) o[i + 1] = s[i];
-    o[len] = '\0';
-    return o;
-}
-
-static void *worker(void *arg) {
-    plugin_node *node = (plugin_node *)arg;
-    char *s = NULL;
-    while (bq_pop(node->queue, &s) == 0) {
-        if (s == BQ_END_SENTINEL || (s && strcmp(s, "<END>") == 0)) {
-            if (node->next_place) (void)node->next_place(BQ_END_SENTINEL);
-            break;
-        }
-        char *o = rotate_right_by_one(s);
-        free(s);
-        if (!o) continue;
-        if (node->next_place) (void)node->next_place(o);
-        free(o);
+static char* rotate_right(char* input) {
+    if (!input) {
+        return NULL;
     }
-    return NULL;
+    size_t len = strlen(input);
+    if (len <= 1) {
+        return input;
+    }
+    char last = input[len - 1];
+    memmove(input + 1, input, len - 1);
+    input[0] = last;
+    return input;
 }
 
 const char* plugin_get_name(void) { return "rotator"; }
 
-const char* plugin_init(int queue_size) { return plugin_node_init(&N, queue_size, worker) == 0 ? NULL : "rotator: init failed"; }
-void plugin_attach(const char* (*next_place_work)(const char*)) { plugin_node_attach(&N, next_place_work); }
-const char* plugin_place_work(const char* str) { return plugin_node_place_work(&N, str); }
-const char* plugin_fini(void) { return plugin_node_fini(&N); }
-const char* plugin_wait_finished(void) { return plugin_node_wait(&N); }
+const char* plugin_init(int queue_size) {
+    return common_plugin_init(&g_ctx, rotate_right, "rotator", queue_size);
+}
 
+void plugin_attach(const char* (*next_place_work)(const char*)) {
+    common_plugin_attach(&g_ctx, next_place_work);
+}
+
+const char* plugin_place_work(const char* str) {
+    return common_plugin_place_work(&g_ctx, str);
+}
+
+const char* plugin_wait_finished(void) {
+    return common_plugin_wait_finished(&g_ctx);
+}
+
+const char* plugin_fini(void) {
+    return common_plugin_fini(&g_ctx);
+}
 
