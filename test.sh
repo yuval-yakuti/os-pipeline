@@ -6,6 +6,28 @@ cd "$(dirname "$0")"
 pass() { :; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+# Timeout helper (argv-safe)
+run_with_timeout() {
+  ( "$@" ) & p=$!
+  ( sleep 3; kill -0 "$p" 2>/dev/null && kill "$p" >/dev/null 2>&1 || true ) >/dev/null 2>&1 &
+  w=$!
+  wait "$p" || true
+  rc=$?
+  kill "$w" >/dev/null 2>&1 || true
+  return $rc
+}
+
+# Poller for logger file to avoid stale tail
+wait_for_log_line() {
+  local tries=40
+  while (( tries-- > 0 )); do
+    local last="$(tail -n1 output/pipeline.log 2>/dev/null || true)"
+    [[ -n "$last" ]] && { printf '%s\n' "$last"; return 0; }
+    sleep 0.1
+  done
+  printf '\n'; return 1
+}
+
 # Build (quiet)
 ./build.sh >/dev/null 2>&1
 
@@ -13,14 +35,9 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 export TYPEWRITER_DELAY_US=1000
 
 # 1) logger
-rm -f output/pipeline.log
-echo "hello world" | ./build/pipeline logger >/dev/null 2>&1
-# Wait briefly for file to be written to avoid flakiness on some systems
-for _ in 1 2 3 4 5; do
-  last_line="$(tail -n 1 output/pipeline.log 2>/dev/null || true)"
-  [[ -n "$last_line" ]] && break
-  sleep 0.05
-done
+: > output/pipeline.log
+run_with_timeout sh -c 'printf "hello world\n<END>\n" | ./build/pipeline logger >/dev/null 2>&1'
+last_line="$(wait_for_log_line || true)"
 if [[ "${last_line}" != "hello world" ]]; then
   fail "logger: expected last log line 'hello world', got '${last_line}'"
 fi
@@ -28,7 +45,8 @@ pass "logger"
 
 # 2) uppercaser (logger -> file)
 : > output/pipeline.log
-out="$(echo "Hello World" | ./build/pipeline uppercaser,logger >/dev/null 2>&1; tail -n 1 output/pipeline.log)"
+run_with_timeout sh -c 'printf "Hello World\n<END>\n" | ./build/pipeline uppercaser,logger >/dev/null 2>&1'
+out="$(wait_for_log_line || true)"
 if [[ "${out}" != "HELLO WORLD" ]]; then
   fail "uppercaser: expected 'HELLO WORLD', got '${out}'"
 fi
@@ -36,8 +54,8 @@ pass "uppercaser"
 
 # 3) rotator rotate-right-by-one (assert via logger; robust under runner)
 : > output/pipeline.log
-printf "Abc XyZ\n" | ./build/pipeline rotator,logger >/dev/null 2>rot.err
-out="$(tail -n 1 output/pipeline.log 2>/dev/null || true)"
+run_with_timeout sh -c 'printf "Abc XyZ\n<END>\n" | ./build/pipeline rotator,logger >/dev/null 2>rot.err'
+out="$(wait_for_log_line || true)"
 if [[ "${out}" != "ZAbc Xy" ]]; then
   echo '--- rot.err ---'
   cat rot.err 2>/dev/null || true
@@ -49,27 +67,28 @@ pass "rotator"
 
 # 4) expander→uppercaser→flipper
 : > output/pipeline.log
-out="$(printf "abc\n" | ./build/pipeline expander,uppercaser,flipper,logger >/dev/null 2>&1; tail -n 1 output/pipeline.log)"
+run_with_timeout sh -c 'printf "abc\n<END>\n" | ./build/pipeline expander,uppercaser,flipper,logger >/dev/null 2>&1'
+out="$(wait_for_log_line || true)"
 if [[ "${out}" != "C B A" ]]; then
   fail "expander,uppercaser,flipper: expected 'C B A', got '${out}'"
 fi
 pass "expander→uppercaser→flipper"
 
 # 5) missing plugin must fail
-if ./build/pipeline not_a_plugin >/dev/null 2>&1; then
+if run_with_timeout ./build/pipeline not_a_plugin >/dev/null 2>&1; then
   fail "missing plugin: pipeline should fail when plugin is not found"
 fi
 pass "missing plugin"
 
 # 6) sink_stdout prints line and respects <END>
-out="$(printf "ab cd\n<END>\n" | ./build/pipeline sink_stdout)"
+out="$(run_with_timeout sh -c 'printf "ab cd\n<END>\n" | ./build/pipeline sink_stdout' | cat)"
 if [[ "${out}" != "ab cd"$'' ]]; then
   fail "sink_stdout: expected 'ab cd', got '${out}'"
 fi
 pass "sink_stdout basic"
 
 # 7) sink_stdout EOF-only: only <END> produces no output
-out="$(printf "<END>\n" | ./build/pipeline sink_stdout)"
+out="$(run_with_timeout sh -c 'printf "<END>\n" | ./build/pipeline sink_stdout' | cat)"
 if [[ -n "${out}" ]]; then
   fail "sink_stdout EOF-only: expected empty output, got '${out}'"
 fi
@@ -77,7 +96,7 @@ pass "sink_stdout EOF-only"
 
 # 8) missing plugin emits clear error
 set +e
-err_out=$(./build/pipeline this_plugin_should_not_exist 2>&1 >/dev/null)
+err_out=$(run_with_timeout ./build/pipeline this_plugin_should_not_exist 2>&1 >/dev/null)
 rc=$?
 set -e
 if [[ $rc -eq 0 ]]; then
@@ -91,7 +110,7 @@ pass "missing plugin error message"
 # 9) long line (100k chars): ensure non-empty output and safe newline trim
 # Generate using Python for portability
 long_len=100000
-out_len=$(python3 -c "print('a'*${long_len})" | ./build/pipeline uppercaser,sink_stdout | wc -c)
+out_len=$(python3 -c "print('a'*${long_len})" | run_with_timeout ./build/pipeline uppercaser,sink_stdout | wc -c)
 if [[ ${out_len} -le 0 ]]; then
   fail "long line: expected non-empty output, got length ${out_len}"
 fi
@@ -104,8 +123,47 @@ pass "long line (100k)"
 # 10) monitor unit test build & run
 cc_cmd="${CC:-cc}"
 ${cc_cmd} -std=c11 -O2 -Wall -Wextra -Werror -pthread tests/monitor_test.c -o build/monitor_test
-./build/monitor_test >/dev/null 2>&1 || fail "monitor_test failed"
+run_with_timeout ./build/monitor_test >/dev/null 2>&1 || fail "monitor_test failed"
 pass "monitor unit test"
+
+# 11) analyzer: uppercaser -> logger basic
+EXPECTED="[logger] HELLO"
+ACTUAL=$(printf "hello\n<END>\n" | ./output/analyzer 10 uppercaser logger | grep "\[logger\]" | head -n1 || true)
+if [[ "$ACTUAL" != "$EXPECTED" ]]; then
+  fail "analyzer uppercaser+logger: expected '$EXPECTED', got '$ACTUAL'"
+fi
+pass "analyzer uppercaser+logger"
+
+# 12) analyzer: empty string
+EXPECTED_EMPTY="[logger] "
+ACTUAL_EMPTY=$(printf "\n<END>\n" | ./output/analyzer 5 uppercaser logger | grep "\[logger\]" | head -n1 || true)
+if [[ "$ACTUAL_EMPTY" != "$EXPECTED_EMPTY" ]]; then
+  fail "analyzer empty string: expected '$EXPECTED_EMPTY', got '$ACTUAL_EMPTY'"
+fi
+pass "analyzer empty string"
+
+# 13) analyzer: invalid args (missing queue size)
+set +e
+./output/analyzer >/dev/null 2>&1
+rc=$?
+set -e
+if [[ $rc -eq 0 ]]; then
+  fail "analyzer invalid args should fail"
+fi
+pass "analyzer invalid-args"
+
+# 14) analyzer: missing plugin should fail
+set +e
+err_out=$(./output/analyzer 10 this_plugin_should_not_exist 2>&1 >/dev/null)
+rc=$?
+set -e
+if [[ $rc -eq 0 ]]; then
+  fail "analyzer missing plugin should fail"
+fi
+if ! echo "$err_out" | grep -E "(dlopen failed|missing required symbols)" >/dev/null; then
+  fail "analyzer missing plugin error message not clear: $err_out"
+fi
+pass "analyzer missing plugin error message"
 
 echo "All smoke tests passed."
 
