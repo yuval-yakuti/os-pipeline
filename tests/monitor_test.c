@@ -1,3 +1,5 @@
+// This file was replaced earlier; keep the newer version below and remove duplicate
+
 #define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <pthread.h>
